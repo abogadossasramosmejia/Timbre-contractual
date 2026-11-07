@@ -1,5 +1,5 @@
 """
-Alerta de contratos firmados por la Alcaldía de San José de Cúcuta.
+Alerta de contratos firmados por la Alcaldía de San José de Cúcuta y sus entidades.
 
 Consulta los datos abiertos de SECOP II (datos.gov.co, dataset jbjy-vk9h),
 detecta los contratos con fecha de firma que aún no se han notificado y envía
@@ -25,7 +25,19 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
-NIT_ALCALDIA = "890501434"  # MUNICIPIO DE SAN JOSE DE CUCUTA
+# Entidades vigiladas (NIT tal como aparece en SECOP II -> nombre corto para los avisos)
+ENTIDADES = {
+    "890501434": "Alcaldía de Cúcuta",
+    "807001836": "IMRD (Instituto Municipal de Recreación y Deporte)",
+    "807004352": "ESE IMSALUD",
+    "8905014335": "Central de Transportes Estación Cúcuta",
+    "890500529": "EIS Cúcuta S.A. E.S.P.",
+    "800153197": "Área Metropolitana de Cúcuta",
+    "890505717": "Concejo Municipal de Cúcuta",
+    "8001924348": "Personería Municipal de Cúcuta",
+    "800056348": "Contraloría Municipal de Cúcuta",
+}
+NIT_ALCALDIA = "890501434"
 DATASET_URL = "https://www.datos.gov.co/resource/jbjy-vk9h.json"
 VENTANA_DIAS = 60  # SECOP publica con rezago; revisamos firmas de los últimos 60 días
 STATE_FILE = os.environ.get("ESTADO_PATH") or os.path.join(
@@ -33,7 +45,7 @@ STATE_FILE = os.environ.get("ESTADO_PATH") or os.path.join(
 COLOMBIA = timezone(timedelta(hours=-5))
 
 CAMPOS = [
-    "id_contrato", "referencia_del_contrato", "fecha_de_firma", "objeto_del_contrato",
+    "nit_entidad", "id_contrato", "referencia_del_contrato", "fecha_de_firma", "objeto_del_contrato",
     "proveedor_adjudicado", "documento_proveedor", "valor_del_contrato",
     "modalidad_de_contratacion", "tipo_de_contrato", "estado_contrato",
     "duraci_n_del_contrato", "urlproceso",
@@ -41,12 +53,13 @@ CAMPOS = [
 
 
 def consultar_contratos(desde):
-    """Devuelve los contratos de la Alcaldía firmados desde la fecha indicada."""
+    """Devuelve los contratos de las entidades vigiladas firmados desde la fecha indicada."""
     resultados, offset, pagina = [], 0, 5000
+    nits = ",".join(f"'{n}'" for n in ENTIDADES)
     while True:
         params = {
             "$select": ",".join(CAMPOS),
-            "$where": f"nit_entidad='{NIT_ALCALDIA}' AND fecha_de_firma >= '{desde}'",
+            "$where": f"nit_entidad in({nits}) AND fecha_de_firma >= '{desde}'",
             "$order": "fecha_de_firma DESC, id_contrato",
             "$limit": pagina,
             "$offset": offset,
@@ -83,6 +96,7 @@ def guardar_estado(notificados):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
             {"actualizado": datetime.now(COLOMBIA).isoformat(timespec="seconds"),
+             "entidades": sorted(ENTIDADES),
              "notificados": dict(sorted(notificados.items()))},
             f, ensure_ascii=False, indent=1,
         )
@@ -105,16 +119,27 @@ def fecha_corta(f):
     return (f or "")[:16].replace("T", " ")
 
 
+def entidad_de(c):
+    return ENTIDADES.get(c.get("nit_entidad"), c.get("nit_entidad", ""))
+
+
+def resumen_por_entidad(contratos):
+    cuenta = {}
+    for c in contratos:
+        cuenta[entidad_de(c)] = cuenta.get(entidad_de(c), 0) + 1
+    return ", ".join(f"{k}: {v}" for k, v in sorted(cuenta.items(), key=lambda x: -x[1]))
+
+
 def construir_correo(nuevos):
     n = len(nuevos)
     total = sum(float(c.get("valor_del_contrato") or 0) for c in nuevos)
-    asunto = f"🔔 {n} contrato{'s' if n != 1 else ''} nuevo{'s' if n != 1 else ''} firmado{'s' if n != 1 else ''} – Alcaldía de Cúcuta"
+    asunto = f"🔔 {n} contrato{'s' if n != 1 else ''} nuevo{'s' if n != 1 else ''} firmado{'s' if n != 1 else ''} – Cúcuta (Alcaldía y entidades)"
 
     filas_txt, filas_html = [], []
     for c in nuevos:
         objeto = " ".join((c.get("objeto_del_contrato") or "").split())
         filas_txt.append(
-            f"- {fecha_corta(c.get('fecha_de_firma'))} | {c.get('referencia_del_contrato', '')} | "
+            f"- [{entidad_de(c)}] {fecha_corta(c.get('fecha_de_firma'))} | {c.get('referencia_del_contrato', '')} | "
             f"{pesos(c.get('valor_del_contrato'))}\n  Contratista: {c.get('proveedor_adjudicado', '')}\n"
             f"  Objeto: {objeto}\n  {url_de(c)}\n"
         )
@@ -123,6 +148,7 @@ def construir_correo(nuevos):
 <tr>
  <td style="padding:10px;border-bottom:1px solid #ddd;vertical-align:top;white-space:nowrap">{html.escape(fecha_corta(c.get('fecha_de_firma')))}<br><small>{e('referencia_del_contrato')}</small></td>
  <td style="padding:10px;border-bottom:1px solid #ddd;vertical-align:top">
+   <span style="color:#0b5cad;font-size:12px;font-weight:bold">{html.escape(entidad_de(c))}</span><br>
    <b>{html.escape(objeto[:400])}{'…' if len(objeto) > 400 else ''}</b><br>
    <small>Contratista: {e('proveedor_adjudicado')} ({e('documento_proveedor')})<br>
    {e('modalidad_de_contratacion')} · {e('tipo_de_contrato')} · {e('duraci_n_del_contrato')} · Estado: {e('estado_contrato')}</small><br>
@@ -131,11 +157,13 @@ def construir_correo(nuevos):
  <td style="padding:10px;border-bottom:1px solid #ddd;vertical-align:top;text-align:right;white-space:nowrap"><b>{pesos(c.get('valor_del_contrato'))}</b></td>
 </tr>""")
 
-    texto = (f"{n} contrato(s) nuevo(s) firmados por la Alcaldía de Cúcuta. Valor total: {pesos(total)}\n\n"
+    texto = (f"{n} contrato(s) nuevo(s) firmados en Cúcuta. Valor total: {pesos(total)}\n"
+             f"Por entidad: {resumen_por_entidad(nuevos)}\n\n"
              + "\n".join(filas_txt) + "\nFuente: SECOP II – datos.gov.co")
     cuerpo_html = f"""<div style="font-family:Arial,sans-serif;color:#222">
-<h2 style="margin:0 0 4px">Alcaldía de San José de Cúcuta</h2>
-<p style="margin:0 0 16px">{n} contrato(s) nuevo(s) firmados · Valor total: <b>{pesos(total)}</b></p>
+<h2 style="margin:0 0 4px">Contratos nuevos – Cúcuta</h2>
+<p style="margin:0 0 4px">{n} contrato(s) nuevo(s) firmados · Valor total: <b>{pesos(total)}</b></p>
+<p style="margin:0 0 16px;color:#555;font-size:13px">{html.escape(resumen_por_entidad(nuevos))}</p>
 <table style="border-collapse:collapse;width:100%;font-size:14px">
 <tr style="background:#f2f2f2"><th style="padding:8px;text-align:left">Firma</th><th style="padding:8px;text-align:left">Contrato</th><th style="padding:8px;text-align:right">Valor</th></tr>
 {''.join(filas_html)}
@@ -145,10 +173,10 @@ def construir_correo(nuevos):
 
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["fecha_firma", "referencia", "objeto", "contratista", "documento", "valor",
+    w.writerow(["entidad", "fecha_firma", "referencia", "objeto", "contratista", "documento", "valor",
                 "modalidad", "tipo", "estado", "duracion", "id_contrato", "url"])
     for c in nuevos:
-        w.writerow([c.get("fecha_de_firma"), c.get("referencia_del_contrato"),
+        w.writerow([entidad_de(c), c.get("fecha_de_firma"), c.get("referencia_del_contrato"),
                     " ".join((c.get("objeto_del_contrato") or "").split()),
                     c.get("proveedor_adjudicado"), c.get("documento_proveedor"),
                     c.get("valor_del_contrato"), c.get("modalidad_de_contratacion"),
@@ -184,6 +212,7 @@ def cuerpo_issue(intro, contratos, max_items=60):
             objeto = objeto[:500] + "…"
         partes.append(
             f"### {pesos(c.get('valor_del_contrato'))} · {c.get('referencia_del_contrato', '')}\n"
+            f"**Entidad:** {entidad_de(c)}  \n"
             f"**Firma:** {fecha_corta(c.get('fecha_de_firma'))}  \n"
             f"**Contratista:** {c.get('proveedor_adjudicado', '')} ({c.get('documento_proveedor', '')})  \n"
             f"**Objeto:** {objeto}  \n"
@@ -236,27 +265,35 @@ def main():
     estado = cargar_estado()
     primera_vez = estado is None
     notificados = {} if primera_vez else estado.get("notificados", {})
+    # Entidades agregadas después de la primera ejecución: se registran sin avisar su histórico.
+    ya_vigiladas = set(ENTIDADES) if primera_vez else set(estado.get("entidades", [NIT_ALCALDIA]))
+    agregadas = [n for n in ENTIDADES if n not in ya_vigiladas]
 
-    nuevos = [c for c in contratos if c.get("id_contrato") and c["id_contrato"] not in notificados]
+    nuevos = [c for c in contratos if c.get("id_contrato") and c["id_contrato"] not in notificados
+              and c.get("nit_entidad") not in agregadas]
     print(f"Nuevos sin notificar: {len(nuevos)}{' (primera ejecución)' if primera_vez else ''}")
 
-    if primera_vez:
-        # No inundar el correo con el histórico: se registra todo y se avisa que quedó activo.
-        asunto = "✅ Alerta de contratos de la Alcaldía de Cúcuta activada"
-        ultimos = contratos[:10]
-        texto = (f"La alerta quedó activa. Se registraron {len(contratos)} contratos firmados en los "
-                 f"últimos {VENTANA_DIAS} días como punto de partida. Desde ahora recibirá un correo "
-                 f"cada vez que aparezcan contratos nuevos en SECOP II.")
+    if primera_vez or agregadas:
+        # No inundar el correo con el histórico: se registra todo y se avisa qué quedó vigilado.
+        base = contratos if primera_vez else [c for c in contratos if c.get("nit_entidad") in agregadas]
+        lista = [ENTIDADES[n] for n in (ENTIDADES if primera_vez else agregadas)]
+        asunto = ("✅ Alerta de contratos de Cúcuta activada" if primera_vez
+                  else f"✅ Se agregaron {len(agregadas)} entidades a la alerta de contratos")
+        texto = (f"Entidades {'vigiladas' if primera_vez else 'agregadas'}: {'; '.join(lista)}. "
+                 f"Se registraron {len(base)} contratos firmados en los últimos {VENTANA_DIAS} días como "
+                 f"punto de partida ({resumen_por_entidad(base) or 'ninguno'}). Desde ahora recibirá un "
+                 f"aviso cada vez que aparezcan contratos nuevos en SECOP II.")
+        ultimos = base[:10]
         _, _, tabla_html, _ = construir_correo(ultimos) if ultimos else ("", "", "", "")
-        cuerpo = f"<p style='font-family:Arial'>{html.escape(texto)}</p><p style='font-family:Arial'>Últimos 10 contratos firmados (de muestra):</p>{tabla_html}"
-        avisar(dry, asunto, texto, cuerpo, None, ultimos, texto + "\n\n**Últimos 10 contratos firmados (muestra):**")
-    elif nuevos:
+        cuerpo = f"<p style='font-family:Arial'>{html.escape(texto)}</p><p style='font-family:Arial'>Últimos contratos (muestra):</p>{tabla_html}"
+        avisar(dry, asunto, texto, cuerpo, None, ultimos, texto + "\n\n**Últimos contratos firmados (muestra):**")
+    if nuevos and not primera_vez:
         nuevos.sort(key=lambda c: c.get("fecha_de_firma") or "", reverse=True)
         asunto, texto, cuerpo, csv_texto = construir_correo(nuevos)
         total = sum(float(c.get("valor_del_contrato") or 0) for c in nuevos)
         avisar(dry, asunto, texto, cuerpo, csv_texto, nuevos,
-               f"{len(nuevos)} contrato(s) nuevo(s) firmados por la Alcaldía de Cúcuta · "
-               f"Valor total: **{pesos(total)}**")
+               f"{len(nuevos)} contrato(s) nuevo(s) firmados en Cúcuta · Valor total: **{pesos(total)}**  \n"
+               f"Por entidad: {resumen_por_entidad(nuevos)}")
 
     for c in contratos:
         if c.get("id_contrato"):
